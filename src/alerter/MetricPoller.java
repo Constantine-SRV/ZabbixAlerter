@@ -12,145 +12,155 @@ import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 
 public class MetricPoller {
+
     private final List<Metric> metrics;
     private final ZabbixClient client;
     private final TelegramNotifier notifier;
     private final ScheduledExecutorService scheduler;
     private final ExecutorService pool;
-    private final int periodSeconds;
-    private final int statusPrintIntervalMinutes;
+    private final int pollSec;
+    private final int statusEveryMin;
 
+    /* last values saved only for pretty console output */
     private final ConcurrentMap<Long, Double> lastValues = new ConcurrentHashMap<>();
 
-    public MetricPoller(List<Metric> metrics, ZabbixClient client, TelegramNotifier notifier, int poolSize, int periodSeconds, int statusPrintIntervalMinutes) {
+    public MetricPoller(List<Metric> metrics,
+                        ZabbixClient client,
+                        TelegramNotifier notifier,
+                        int poolSize,
+                        int pollSeconds,
+                        int statusEveryMinutes) {
+
         this.metrics = metrics;
         this.client = client;
         this.notifier = notifier;
-        this.periodSeconds = periodSeconds;
-        this.statusPrintIntervalMinutes = statusPrintIntervalMinutes;
+        this.pollSec = pollSeconds;
+        this.statusEveryMin = statusEveryMinutes;
         this.pool = Executors.newFixedThreadPool(poolSize);
         this.scheduler = Executors.newSingleThreadScheduledExecutor();
     }
 
     public void start() {
-        scheduler.scheduleAtFixedRate(this::pollAll, 0, periodSeconds, TimeUnit.SECONDS);
+        scheduler.scheduleAtFixedRate(this::pollAll, 0, pollSec, TimeUnit.SECONDS);
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            scheduler.shutdown();
-            pool.shutdown();
+            scheduler.shutdown(); pool.shutdown();
         }));
     }
 
+    /** Single polling cycle for all metrics */
     private void pollAll() {
-        final AtomicInteger successCount = new AtomicInteger(0);
-
-        LocalDateTime now = LocalDateTime.now();
-        int currentMinute = now.getMinute();
-        String nowStr = now.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
-        boolean printStatusNow = (currentMinute % statusPrintIntervalMinutes == 0);
+        AtomicInteger success = new AtomicInteger(0);
+        LocalDateTime nowDT = LocalDateTime.now();
+        String ts = nowDT.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
+        boolean logNow = (nowDT.getMinute() % statusEveryMin == 0);
 
         for (Metric m : metrics) {
-            final Metric metric = m;
-            String statusMsg = null;
-
-            if (metric.getMetricId() == null) {
-                statusMsg = String.format("[%s] [SKIP] %s %s: No itemId found (not monitored)",
-                        nowStr, metric.getHost(), metric.getKey());
-                if (printStatusNow) System.out.println(statusMsg);
+            // skip unresolved
+            if (m.getMetricId() == null) {
+                if (logNow)
+                    System.out.printf("[%s] [SKIP] %s %s: no itemId%n", ts, m.getHost(), m.getKey());
                 continue;
             }
+            final Metric metric = m;
 
             pool.submit(() -> {
-                String threadMsg = null;
+                String msg = null;
                 try {
-                    ZabbixValue val = client.getLastValueAndClock(metric.getMetricId());
-                    if (val == null) {
+                    ZabbixValue zv = client.getLastValueAndClock(metric.getMetricId());
+                    if (zv == null) {                             // no data
                         lastValues.remove(metric.getMetricId());
-                        threadMsg = String.format("[%s] [NO DATA] %s %s: itemId=%s, Zabbix returned no values (maybe item not supported, not updating or no data yet)",
-                                nowStr, metric.getHost(), metric.getKey(), metric.getMetricId());
-                        if (printStatusNow) System.out.println(threadMsg);
-                        return;
-                    }
-                    successCount.incrementAndGet();
-                    lastValues.put(metric.getMetricId(), val.value);
-
-                    double value = val.value;
-                    long lastClock = val.clock;
-                    long nowEpoch = Instant.now().getEpochSecond();
-
-                    // Check for old value
-                    if (nowEpoch - lastClock > 600) {
-                        threadMsg = String.format("[%s] [ALERT: OLD_VALUE] %s %s: itemId=%s, value=%s, last update=%d sec ago (>600)",
-                                nowStr, metric.getHost(), metric.getKey(), metric.getMetricId(), value, nowEpoch - lastClock);
+                        msg = String.format("[%s] [NO DATA] %s %s (id=%s)",
+                                ts, metric.getHost(), metric.getKey(), metric.getMetricId());
+                        // old-value alert
                         if (!AlertManager.wasAlerted(metric.getMetricId(), AlertManager.AlertType.OLD_VALUE)) {
-                            notifier.sendMessage("Metric " + metric.getKey() +
-                                    " on " + metric.getHost() + " has not been updated for more than 10 minutes.");
+                            notifier.sendMessage("OLD_VALUE: " + metric.getKey() + " on " + metric.getHost());
                             AlertManager.setAlert(metric.getMetricId(), AlertManager.AlertType.OLD_VALUE);
                         }
-                        if (printStatusNow) System.out.println(threadMsg);
+                        if (logNow) System.out.println(msg);
                         return;
                     }
 
-                    // Check if value is above threshold
-                    if (value > metric.getThresholdHigh()) {
-                        threadMsg = String.format("[%s] [ALERT: OVER] %s %s: itemId=%s, value=%s > thresholdHigh=%s",
-                                nowStr, metric.getHost(), metric.getKey(), metric.getMetricId(), value, metric.getThresholdHigh());
-                        if (!AlertManager.wasAlerted(metric.getMetricId(), AlertManager.AlertType.OVER)) {
-                            notifier.sendMessage("ALERT: " + metric.getKey() + " on " + metric.getHost() +
-                                    " exceeded threshold: " + value + " > " + metric.getThresholdHigh());
+                    success.incrementAndGet();
+                    lastValues.put(metric.getMetricId(), zv.value);
+                    double v   = zv.value;
+                    long   age = Instant.now().getEpochSecond() - zv.clock;
+
+                    // clear OLD_VALUE if data has resumed
+                    if (AlertManager.wasAlerted(metric.getMetricId(), AlertManager.AlertType.OLD_VALUE) && age < 600) {
+                        notifier.sendMessage("Value resumed: " + metric.getKey() + " on " + metric.getHost() + " = " + v);
+                        AlertManager.clearAlert(metric.getMetricId());
+                    }
+
+                    /* ---------- hysteresis ---------- */
+                    if (metric.isMaxType()) {
+                        // trigger
+                        if (v >= metric.getThresholdHigh()
+                                && !AlertManager.wasAlerted(metric.getMetricId(), AlertManager.AlertType.OVER)) {
+
+                            notifier.sendMessage("OVER: " + metric.getKey() + " " + v + " >= " + metric.getThresholdHigh());
                             AlertManager.setAlert(metric.getMetricId(), AlertManager.AlertType.OVER);
+                            msg = String.format("[%s] [ALERT: OVER] %s %s v=%s >= %s",
+                                    ts, metric.getHost(), metric.getKey(), v, metric.getThresholdHigh());
                         }
-                    } else {
-                        // OK, back to normal
-                        threadMsg = String.format("[%s] [OK] %s %s: itemId=%s, value=%s, in range (<=%s)",
-                                nowStr, metric.getHost(), metric.getKey(), metric.getMetricId(), value, metric.getThresholdHigh());
-                        if (AlertManager.wasAlerted(metric.getMetricId(), AlertManager.AlertType.OVER)) {
-                            notifier.sendMessage("Metric " + metric.getKey() + " on " + metric.getHost() + " returned to normal: " + value);
+                        // clear
+                        if (v <= metric.getThresholdLow()
+                                && AlertManager.wasAlerted(metric.getMetricId(), AlertManager.AlertType.OVER)) {
+
+                            notifier.sendMessage("CLEARED: " + metric.getKey() + " back to " + v);
                             AlertManager.clearAlert(metric.getMetricId());
+                            msg = String.format("[%s] [CLEAR] %s %s v=%s <= %s",
+                                    ts, metric.getHost(), metric.getKey(), v, metric.getThresholdLow());
                         }
-                        if (AlertManager.wasAlerted(metric.getMetricId(), AlertManager.AlertType.OLD_VALUE)) {
-                            notifier.sendMessage("Metric " + metric.getKey() + " on " + metric.getHost() + " is updating again: " + value);
+                    } else { // MIN type
+                        // trigger
+                        if (v <= metric.getThresholdLow()
+                                && !AlertManager.wasAlerted(metric.getMetricId(), AlertManager.AlertType.UNDER)) {
+
+                            notifier.sendMessage("UNDER: " + metric.getKey() + " " + v + " <= " + metric.getThresholdLow());
+                            AlertManager.setAlert(metric.getMetricId(), AlertManager.AlertType.UNDER);
+                            msg = String.format("[%s] [ALERT: UNDER] %s %s v=%s <= %s",
+                                    ts, metric.getHost(), metric.getKey(), v, metric.getThresholdLow());
+                        }
+                        // clear
+                        if (v >= metric.getThresholdHigh()
+                                && AlertManager.wasAlerted(metric.getMetricId(), AlertManager.AlertType.UNDER)) {
+
+                            notifier.sendMessage("CLEARED: " + metric.getKey() + " back to " + v);
                             AlertManager.clearAlert(metric.getMetricId());
+                            msg = String.format("[%s] [CLEAR] %s %s v=%s >= %s",
+                                    ts, metric.getHost(), metric.getKey(), v, metric.getThresholdHigh());
                         }
                     }
 
-                    // Restore ZABBIX_DOWN if previously set and now ok
-                    if (AlertManager.isGlobalZabbixDown()) {
-                        notifier.sendMessage("Connection to Zabbix is restored.");
-                        AlertManager.clearGlobalZabbixDown();
+                    if (msg == null && logNow) {          // regular OK line
+                        msg = String.format("[%s] [OK] %s %s: %s", ts, metric.getHost(), metric.getKey(), v);
                     }
 
                 } catch (Exception e) {
-                    threadMsg = String.format("[%s] [ERROR] %s %s: itemId=%s, %s",
-                            nowStr, metric.getHost(), metric.getKey(), metric.getMetricId(), e.getMessage());
+                    msg = String.format("[%s] [ERROR] %s %s: %s",
+                            ts, metric.getHost(), metric.getKey(), e.getMessage());
                 }
-                if (printStatusNow && threadMsg != null) {
-                    System.out.println(threadMsg);
-                }
+                if (logNow && msg != null) System.out.println(msg);
             });
         }
 
-        // Global ZABBIX_DOWN logic (check after a short delay)
+        /* global Zabbix-down check */
         scheduler.schedule(() -> {
-            if (successCount.get() == 0 && !AlertManager.isGlobalZabbixDown()) {
-                final String zabbixDownStr = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
+            if (success.get() == 0 && !AlertManager.isGlobalDown()) {
+                String now = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
+                System.out.printf("[%s] [ALERT] ZABBIX DOWN%n", now);
                 try {
-                    if (printStatusNow)
-                        System.out.printf("[%s] [ALERT] ZABBIX DOWN: No data from all monitored metrics!%n", zabbixDownStr);
-                    notifier.sendMessage("ZABBIX DOWN: Unable to get data for all metrics. Zabbix may be unavailable.");
-                    AlertManager.setGlobalZabbixDown();
-                } catch (Exception e) {
-                    System.err.println("Error sending global ZABBIX_DOWN alert: " + e.getMessage());
-                }
+                    notifier.sendMessage("ZABBIX DOWN: no data for any metric");
+                } catch (Exception ignored) {}
+                AlertManager.setGlobalDown();
             }
         }, 5, TimeUnit.SECONDS);
     }
 
+    /* holder */
     public static class ZabbixValue {
         public final double value;
-        public final long clock;
-        public ZabbixValue(double value, long clock) {
-            this.value = value;
-            this.clock = clock;
-        }
+        public final long   clock;
+        public ZabbixValue(double v, long c) { value = v; clock = c; }
     }
 }
