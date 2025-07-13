@@ -11,17 +11,25 @@ import java.util.List;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 
+/**
+ * MetricPoller
+ * -------------
+ * • Polls Zabbix items every <pollSec> seconds.<br>
+ * • Works with MAX / MIN metrics (hysteresis).<br>
+ * • Telegram messages now contain host and use tags
+ *     “ALERT MAX / ALERT MIN” instead of OVER / UNDER.<br>
+ * • Console shows “ALERT … ongoing” while alarm is active.
+ */
 public class MetricPoller {
 
-    private final List<Metric> metrics;
-    private final ZabbixClient client;
+    private final List<Metric>  metrics;
+    private final ZabbixClient  client;
     private final TelegramNotifier notifier;
     private final ScheduledExecutorService scheduler;
     private final ExecutorService pool;
     private final int pollSec;
     private final int statusEveryMin;
 
-    /* last values saved only for pretty console output */
     private final ConcurrentMap<Long, Double> lastValues = new ConcurrentHashMap<>();
 
     public MetricPoller(List<Metric> metrics,
@@ -31,31 +39,32 @@ public class MetricPoller {
                         int pollSeconds,
                         int statusEveryMinutes) {
 
-        this.metrics = metrics;
-        this.client = client;
-        this.notifier = notifier;
-        this.pollSec = pollSeconds;
+        this.metrics        = metrics;
+        this.client         = client;
+        this.notifier       = notifier;
+        this.pollSec        = pollSeconds;
         this.statusEveryMin = statusEveryMinutes;
-        this.pool = Executors.newFixedThreadPool(poolSize);
-        this.scheduler = Executors.newSingleThreadScheduledExecutor();
+        this.pool           = Executors.newFixedThreadPool(poolSize);
+        this.scheduler      = Executors.newSingleThreadScheduledExecutor();
     }
 
     public void start() {
         scheduler.scheduleAtFixedRate(this::pollAll, 0, pollSec, TimeUnit.SECONDS);
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            scheduler.shutdown(); pool.shutdown();
+            scheduler.shutdown();
+            pool.shutdown();
         }));
     }
 
-    /** Single polling cycle for all metrics */
+    /* ---------------- main loop ---------------- */
     private void pollAll() {
         AtomicInteger success = new AtomicInteger(0);
-        LocalDateTime nowDT = LocalDateTime.now();
-        String ts = nowDT.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
-        boolean logNow = (nowDT.getMinute() % statusEveryMin == 0);
+
+        LocalDateTime now  = LocalDateTime.now();
+        String ts          = now.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
+        boolean logNow     = (now.getMinute() % statusEveryMin == 0);
 
         for (Metric m : metrics) {
-            // skip unresolved
             if (m.getMetricId() == null) {
                 if (logNow)
                     System.out.printf("[%s] [SKIP] %s %s: no itemId%n", ts, m.getHost(), m.getKey());
@@ -64,100 +73,105 @@ public class MetricPoller {
             final Metric metric = m;
 
             pool.submit(() -> {
-                String msg = null;
+                String line = null;
+
                 try {
                     ZabbixValue zv = client.getLastValueAndClock(metric.getMetricId());
-                    if (zv == null) {                             // no data
+                    if (zv == null) {                          // NO DATA
                         lastValues.remove(metric.getMetricId());
-                        msg = String.format("[%s] [NO DATA] %s %s (id=%s)",
-                                ts, metric.getHost(), metric.getKey(), metric.getMetricId());
-                        // old-value alert
                         if (!AlertManager.wasAlerted(metric.getMetricId(), AlertManager.AlertType.OLD_VALUE)) {
-                            notifier.sendMessage("OLD_VALUE: " + metric.getKey() + " on " + metric.getHost());
+                            notifier.sendMessage("OLD_VALUE: " + metric.getHost() + " " + metric.getKey());
                             AlertManager.setAlert(metric.getMetricId(), AlertManager.AlertType.OLD_VALUE);
                         }
-                        if (logNow) System.out.println(msg);
-                        return;
-                    }
+                        line = String.format("[%s] [NO DATA] %s %s",
+                                ts, metric.getHost(), metric.getKey());
+                    } else {
+                        success.incrementAndGet();
+                        double v = zv.value;
+                        lastValues.put(metric.getMetricId(), v);
 
-                    success.incrementAndGet();
-                    lastValues.put(metric.getMetricId(), zv.value);
-                    double v   = zv.value;
-                    long   age = Instant.now().getEpochSecond() - zv.clock;
-
-                    // clear OLD_VALUE if data has resumed
-                    if (AlertManager.wasAlerted(metric.getMetricId(), AlertManager.AlertType.OLD_VALUE) && age < 600) {
-                        notifier.sendMessage("Value resumed: " + metric.getKey() + " on " + metric.getHost() + " = " + v);
-                        AlertManager.clearAlert(metric.getMetricId());
-                    }
-
-                    /* ---------- hysteresis ---------- */
-                    if (metric.isMaxType()) {
-                        // trigger
-                        if (v >= metric.getThresholdHigh()
-                                && !AlertManager.wasAlerted(metric.getMetricId(), AlertManager.AlertType.OVER)) {
-
-                            notifier.sendMessage("OVER: " + metric.getKey() + " " + v + " >= " + metric.getThresholdHigh());
-                            AlertManager.setAlert(metric.getMetricId(), AlertManager.AlertType.OVER);
-                            msg = String.format("[%s] [ALERT: OVER] %s %s v=%s >= %s",
-                                    ts, metric.getHost(), metric.getKey(), v, metric.getThresholdHigh());
-                        }
-                        // clear
-                        if (v <= metric.getThresholdLow()
-                                && AlertManager.wasAlerted(metric.getMetricId(), AlertManager.AlertType.OVER)) {
-
-                            notifier.sendMessage("CLEARED: " + metric.getKey() + " back to " + v);
+                        /* clear OLD_VALUE */
+                        if (AlertManager.wasAlerted(metric.getMetricId(), AlertManager.AlertType.OLD_VALUE)) {
+                            notifier.sendMessage("Value resumed: " + metric.getHost() + " " + metric.getKey() + " v=" + v);
                             AlertManager.clearAlert(metric.getMetricId());
-                            msg = String.format("[%s] [CLEAR] %s %s v=%s <= %s",
-                                    ts, metric.getHost(), metric.getKey(), v, metric.getThresholdLow());
                         }
-                    } else { // MIN type
-                        // trigger
-                        if (v <= metric.getThresholdLow()
-                                && !AlertManager.wasAlerted(metric.getMetricId(), AlertManager.AlertType.UNDER)) {
 
-                            notifier.sendMessage("UNDER: " + metric.getKey() + " " + v + " <= " + metric.getThresholdLow());
-                            AlertManager.setAlert(metric.getMetricId(), AlertManager.AlertType.UNDER);
-                            msg = String.format("[%s] [ALERT: UNDER] %s %s v=%s <= %s",
-                                    ts, metric.getHost(), metric.getKey(), v, metric.getThresholdLow());
+                        /* ------------- HYSTERESIS ------------- */
+                        if (metric.isMaxType()) {                // MAX
+                            if (v >= metric.getThresholdHigh()
+                                    && !AlertManager.wasAlerted(metric.getMetricId(), AlertManager.AlertType.OVER)) {
+
+                                notifier.sendMessage("ALERT MAX: " + metric.getHost() + " " + metric.getKey() + " " + v);
+                                AlertManager.setAlert(metric.getMetricId(), AlertManager.AlertType.OVER);
+                                line = String.format("[%s] [ALERT MAX] %s %s v=%s >= %s",
+                                        ts, metric.getHost(), metric.getKey(), v, metric.getThresholdHigh());
+                            } else if (v <= metric.getThresholdLow()
+                                    && AlertManager.wasAlerted(metric.getMetricId(), AlertManager.AlertType.OVER)) {
+
+                                notifier.sendMessage("CLEAR MAX: " + metric.getHost() + " " + metric.getKey() + " v=" + v);
+                                AlertManager.clearAlert(metric.getMetricId());
+                                line = String.format("[%s] [CLEAR] %s %s v=%s <= %s",
+                                        ts, metric.getHost(), metric.getKey(), v, metric.getThresholdLow());
+                            }
+                        } else {                                // MIN
+                            if (v <= metric.getThresholdLow()
+                                    && !AlertManager.wasAlerted(metric.getMetricId(), AlertManager.AlertType.UNDER)) {
+
+                                notifier.sendMessage("ALERT MIN: " + metric.getHost() + " " + metric.getKey() + " " + v);
+                                AlertManager.setAlert(metric.getMetricId(), AlertManager.AlertType.UNDER);
+                                line = String.format("[%s] [ALERT MIN] %s %s v=%s <= %s",
+                                        ts, metric.getHost(), metric.getKey(), v, metric.getThresholdLow());
+                            } else if (v >= metric.getThresholdHigh()
+                                    && AlertManager.wasAlerted(metric.getMetricId(), AlertManager.AlertType.UNDER)) {
+
+                                notifier.sendMessage("CLEAR MIN: " + metric.getHost() + " " + metric.getKey() + " v=" + v);
+                                AlertManager.clearAlert(metric.getMetricId());
+                                line = String.format("[%s] [CLEAR] %s %s v=%s >= %s",
+                                        ts, metric.getHost(), metric.getKey(), v, metric.getThresholdHigh());
+                            }
                         }
-                        // clear
-                        if (v >= metric.getThresholdHigh()
-                                && AlertManager.wasAlerted(metric.getMetricId(), AlertManager.AlertType.UNDER)) {
 
-                            notifier.sendMessage("CLEARED: " + metric.getKey() + " back to " + v);
-                            AlertManager.clearAlert(metric.getMetricId());
-                            msg = String.format("[%s] [CLEAR] %s %s v=%s >= %s",
-                                    ts, metric.getHost(), metric.getKey(), v, metric.getThresholdHigh());
+                        /* ongoing / OK */
+                        if (line == null && logNow) {
+                            AlertManager.AlertType active = AlertManager.getAlert(metric.getMetricId());
+                            if (active == AlertManager.AlertType.OVER || active == AlertManager.AlertType.UNDER) {
+                                line = String.format("[%s] [ALERT %s] %s %s ongoing, value=%s",
+                                        ts,
+                                        active == AlertManager.AlertType.OVER ? "MAX" : "MIN",
+                                        metric.getHost(), metric.getKey(), v);
+                            } else {
+                                line = String.format("[%s] [OK] %s %s: %s",
+                                        ts, metric.getHost(), metric.getKey(), v);
+                            }
                         }
                     }
 
-                    if (msg == null && logNow) {          // regular OK line
-                        msg = String.format("[%s] [OK] %s %s: %s", ts, metric.getHost(), metric.getKey(), v);
+                    /* global-down restore */
+                    if (AlertManager.isGlobalDown() && success.get() > 0) {
+                        notifier.sendMessage("Zabbix connection restored (" + metric.getHost() + ")");
+                        AlertManager.clearGlobalDown();
                     }
 
                 } catch (Exception e) {
-                    msg = String.format("[%s] [ERROR] %s %s: %s",
+                    line = String.format("[%s] [ERROR] %s %s: %s",
                             ts, metric.getHost(), metric.getKey(), e.getMessage());
                 }
-                if (logNow && msg != null) System.out.println(msg);
+                if (logNow && line != null) System.out.println(line);
             });
         }
 
         /* global Zabbix-down check */
         scheduler.schedule(() -> {
             if (success.get() == 0 && !AlertManager.isGlobalDown()) {
-                String now = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
-                System.out.printf("[%s] [ALERT] ZABBIX DOWN%n", now);
-                try {
-                    notifier.sendMessage("ZABBIX DOWN: no data for any metric");
-                } catch (Exception ignored) {}
+                String t = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
+                System.out.printf("[%s] [ALERT] ZABBIX DOWN%n", t);
+                try { notifier.sendMessage("ZABBIX DOWN: no data"); } catch (Exception ignored) {}
                 AlertManager.setGlobalDown();
             }
         }, 5, TimeUnit.SECONDS);
     }
 
-    /* holder */
+    /** DTO from history.get */
     public static class ZabbixValue {
         public final double value;
         public final long   clock;
