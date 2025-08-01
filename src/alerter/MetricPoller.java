@@ -4,7 +4,6 @@ import config.Metric;
 import zabbix.ZabbixClient;
 import telegram.TelegramNotifier;
 
-import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.List;
@@ -90,6 +89,9 @@ public class MetricPoller {
                         double v = zv.value;
                         lastValues.put(metric.getMetricId(), v);
 
+                        /* mark last Zabbix success */
+                        AlertManager.updateLastSuccessRead();
+
                         /* clear OLD_VALUE */
                         if (AlertManager.wasAlerted(metric.getMetricId(), AlertManager.AlertType.OLD_VALUE)) {
                             notifier.sendMessage("Value resumed: " + metric.getHost() + " " + metric.getKey() + " v=" + v);
@@ -162,7 +164,7 @@ public class MetricPoller {
 
         /* global Zabbix-down check */
         scheduler.schedule(() -> {
-            if (success.get() == 0 && !AlertManager.isGlobalDown()) {
+            if (success.get() == 0 && !AlertManager.isGlobalDown() && AlertManager.shouldAlertZabbixDown()) {
                 String t = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
                 System.out.printf("[%s] [ALERT] ZABBIX DOWN%n", t);
                 try { notifier.sendMessage("ZABBIX DOWN: no data"); } catch (Exception ignored) {}

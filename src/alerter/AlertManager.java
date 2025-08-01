@@ -17,6 +17,12 @@ public final class AlertManager {
     /** Special key (0L) used for global ZABBIX_DOWN alert */
     private static final Long GLOBAL = 0L;
 
+    /** Timestamp of last successful Zabbix poll (in ms since epoch) */
+    private static volatile long lastSuccessRead = System.currentTimeMillis();
+
+    /** Minimum duration (ms) before raising ZABBIX DOWN alert */
+    public static long thresholdMs = 5 * 60 * 1000; // 5 minutes
+
     private AlertManager() {}
 
     public static boolean wasAlerted(long itemId, AlertType type) {
@@ -36,4 +42,14 @@ public final class AlertManager {
     public static boolean isGlobalDown() { return wasAlerted(GLOBAL, AlertType.ZABBIX_DOWN); }
     public static void setGlobalDown()  { setAlert(GLOBAL,  AlertType.ZABBIX_DOWN); }
     public static void clearGlobalDown(){ clearAlert(GLOBAL); }
+
+    /** Updates timestamp of last successful Zabbix poll */
+    public static void updateLastSuccessRead() {
+        lastSuccessRead = System.currentTimeMillis();
+    }
+
+    /** Returns true if Zabbix is considered DOWN long enough */
+    public static boolean shouldAlertZabbixDown() {
+        return (System.currentTimeMillis() - lastSuccessRead) > thresholdMs;
+    }
 }
